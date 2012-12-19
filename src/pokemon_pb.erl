@@ -28,6 +28,7 @@
          set_extension/3]).
 -export([decode_extensions/1]).
 -export([encode/1, decode/2]).
+-export([register_pikaservice/3,use_pikaservice/2]).
 -record(pikachu, {abc, def, '$extensions' = dict:new()}).
 
 %% ENCODE
@@ -247,3 +248,13 @@ set_extension(#pikachu{'$extensions' = Extensions} = Record, fieldname, Value) -
     {ok, Record#pikachu{'$extensions' = NewExtends}};
 set_extension(Record, _, _) ->
     {error, Record}.
+
+%% SERVICES
+
+register_pikaservice(Server, Module, State) when is_atom(Module) -> 
+    Methods = [{"Pika", {pika, fun decode_pikachu/1, fun encode_pikachu/1}}], 
+    gossip_rpc_server:register_service(Server, "pokemon.PikaService", Module, Methods, State).
+
+use_pikaservice(Name, Channel) ->
+  Methods = [{pika, {"Pika", fun encode_pikachu/1, fun decode_pikachu/1}}],
+  gossip_rpc_client:start_link(Name, Channel, "pokemon.PikaService", Methods).

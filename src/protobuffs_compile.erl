@@ -31,7 +31,7 @@
 	 generate_source/1, generate_source/2]).
 -endif.
 
--record(collected,{enum=[], msg=[], extensions=[], package}).
+-record(collected,{enum=[], msg=[], extensions=[], services=[], package}).
 
 %%--------------------------------------------------------------------
 %% @doc Generats a built .beam file and header file .hrl
@@ -71,7 +71,7 @@ scan_string(String,Basename,Options) ->
     Parsed = parse_imports(FirstParsed, ImportPaths),
     Collected = collect_full_messages(Parsed), 
     Messages = resolve_types(Collected#collected.msg,Collected#collected.enum),
-    output(Basename, Messages, Collected#collected.enum, Options).
+    output(Basename, Messages, Collected#collected.enum, Collected#collected.services, Options).
     
 %%--------------------------------------------------------------------
 %% @doc Generats a source .erl file and header file .hrl
@@ -99,7 +99,7 @@ generate_source(ProtoFile,Options) when is_list(ProtoFile) ->
     Parsed = parse_imports(FirstParsed, ImportPaths),
     Collected = collect_full_messages(Parsed),
     Messages = resolve_types(Collected#collected.msg,Collected#collected.enum),
-    output_source(Basename, Messages, Collected#collected.enum, Options).
+    output_source(Basename, Messages, Collected#collected.enum, Collected#collected.services, Options).
 
 %% @hidden
 parse_imports(Parsed, Path) ->
@@ -129,7 +129,7 @@ parse_imports([Head | Tail], Path, Acc) ->
     parse_imports(Tail, Path, [Head | Acc]).
 
 %% @hidden
-output(Basename, MessagesRaw, RawEnums, Options) ->
+output(Basename, MessagesRaw, RawEnums, Services, Options) ->
     Messages = canonize_names(MessagesRaw),
     Enums = canonize_names(RawEnums),
     case proplists:get_value(output_include_dir,Options) of
@@ -143,19 +143,30 @@ output(Basename, MessagesRaw, RawEnums, Options) ->
     ok = write_header_include_file(HeaderFile, Messages),
     PokemonBeamFile = code:where_is_file("pokemon_pb.beam"),
     {ok,{_,[{abstract_code,{_,Forms}}]}} = beam_lib:chunks(PokemonBeamFile, [abstract_code]),
-    Forms1 = filter_forms(Messages, Enums, Forms, Basename, []),
-    {ok, _, Bytes, _Warnings} = protobuffs_file:compile_forms(Forms1, proplists:get_value(compile_flags,Options,[])),
-    case proplists:get_value(output_ebin_dir,Options) of
-	undefined ->
-	    BeamFile = Basename ++ ".beam";
-	BeamPath ->
-	    BeamFile = filename:join(BeamPath,Basename) ++ ".beam"
-    end,
-    error_logger:info_msg("Writing beam file to ~p~n",[BeamFile]),
-    protobuffs_file:write_file(BeamFile, Bytes).
+    Forms1 = filter_forms(Messages, Enums, Services, Forms, Basename, []),
+    % error_logger:warning_report(["Compiling forms:", Forms1]),
+    receive after 100 -> ok end,
+    case protobuffs_file:compile_forms(Forms1, proplists:get_value(compile_flags,Options,[])) of 
+    {ok, _, Bytes, _Warnings} -> 
+        case proplists:get_value(output_ebin_dir,Options) of
+    	undefined ->
+    	    BeamFile = Basename ++ ".beam";
+    	BeamPath ->
+    	    BeamFile = filename:join(BeamPath,Basename) ++ ".beam"
+        end,
+        error_logger:info_msg("Writing beam file to ~p~n",[BeamFile]),
+        protobuffs_file:write_file(BeamFile, Bytes);
+    {error, Errors, Warnings} ->
+        [{[], [{ErrorLine, Module, ErrorDescriptor}]}] = Errors,
+        error_logger:warning_report(["Warnings on compiliation:", Warnings]),
+        error_logger:error_report(["Errors on compiliation:", Module:format_error(ErrorDescriptor)]),
+        receive after 100 -> ok end,
+        throw(errors_on_compile)
+    end.
+
 
 %% @hidden
-output_source(Basename, MessagesRaw, Enums, Options) ->
+output_source(Basename, MessagesRaw, Enums, Services, Options) ->
     Messages = canonize_names(MessagesRaw),
     case proplists:get_value(output_include_dir,Options) of
 	undefined ->
@@ -167,7 +178,7 @@ output_source(Basename, MessagesRaw, Enums, Options) ->
     ok = write_header_include_file(HeaderFile, Messages),
     PokemonBeamFile = filename:dirname(code:which(?MODULE)) ++ "/pokemon_pb.beam",
     {ok,{_,[{abstract_code,{_,Forms}}]}} = beam_lib:chunks(PokemonBeamFile, [abstract_code]),
-    Forms1 = filter_forms(Messages, Enums, Forms, Basename, []),
+    Forms1 = filter_forms(Messages, Enums, Services, Forms, Basename, []),
     case proplists:get_value(output_src_dir,Options) of
 	undefined ->
 	    SrcFile = Basename ++ ".erl";
@@ -205,21 +216,21 @@ parse_string(String) ->
     end.
 
 %% @hidden
-filter_forms(Msgs, Enums, [{attribute,L,file,{_,_}}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [{attribute,L,file,{"src/" ++ Basename ++ ".erl",L}}|Acc]);
+filter_forms(Msgs, Enums, Services, [{attribute,L,file,{_,_}}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [{attribute,L,file,{"src/" ++ Basename ++ ".erl",L}}|Acc]);
 
-filter_forms(Msgs, Enums, [{attribute,L,module,pokemon_pb}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [{attribute,L,module,list_to_atom(Basename)}|Acc]);
+filter_forms(Msgs, Enums, Services, [{attribute,L,module,pokemon_pb}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [{attribute,L,module,list_to_atom(Basename)}|Acc]);
 
-filter_forms(Msgs, Enums, [{attribute,L,export,[{encode_pikachu,1},{decode_pikachu,1}]}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{attribute,L,export,[{encode_pikachu,1},{decode_pikachu,1}]}|Tail], Basename, Acc) ->
     Exports = lists:foldl(
 		fun({Name,_,_}, Acc1) ->
 			[{list_to_atom("encode_" ++ string:to_lower(Name)),1},
 			 {list_to_atom("decode_" ++ string:to_lower(Name)),1} | Acc1]
 		end, [], Msgs),
-    filter_forms(Msgs, Enums, Tail, Basename, [{attribute,L,export,Exports}|Acc]);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [{attribute,L,export,Exports}|Acc]);
 
-filter_forms(Msgs, Enums, [{attribute,L,record,{pikachu,_}}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{attribute,L,record,{pikachu,_}}|Tail], Basename, Acc) ->
     Records = [begin
 		   OutFields = [string:to_lower(A) || {_, _, _, A, _} <- lists:keysort(1, Fields)],
        ExtendField = case Extends of
@@ -229,28 +240,28 @@ filter_forms(Msgs, Enums, [{attribute,L,record,{pikachu,_}}|Tail], Basename, Acc
 		   Frm_Fields = [{record_field,L,{atom,L,list_to_atom(OutField)}}|| OutField <- OutFields] ++ ExtendField,
 		   {attribute, L, record, {atomize(Name), Frm_Fields}}
 	       end || {Name, Fields,Extends} <- Msgs],
-    filter_forms(Msgs, Enums, Tail, Basename, Records ++ Acc);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, Records ++ Acc);
 
-filter_forms(Msgs, Enums, [{function,L,encode_pikachu,1,[Clause]}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,encode_pikachu,1,[Clause]}|Tail], Basename, Acc) ->
     Functions = [begin
 		     {function,L,list_to_atom("encode_" ++ string:to_lower(Name)),1,[replace_atom(Clause, pikachu, atomize(Name))]} 
 		 end || {Name, _, _} <- Msgs],
-    filter_forms(Msgs, Enums, Tail, Basename, Functions ++ Acc);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, Functions ++ Acc);
 
-filter_forms(Msgs, Enums, [{function,L,encode,2,[Clause]}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [expand_encode_function(Msgs, L, Clause)|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,L,encode,2,[Clause]}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [expand_encode_function(Msgs, L, Clause)|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,encode_extensions,1,[EncodeClause,Catchall]}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,encode_extensions,1,[EncodeClause,Catchall]}|Tail], Basename, Acc) ->
     NewEncodeClauses = [replace_atom(EncodeClause, pikachu, atomize(Name)) ||
         {Name, _Fields, Extens} <- Msgs, Extens =/= disallowed],
     NewClauses = NewEncodeClauses ++ [Catchall],
     NewFunction = {function,L,encode_extensions,1,NewClauses},
-    filter_forms(Msgs, Enums, Tail, Basename, [NewFunction | Acc]);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [NewFunction | Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,iolist,2,[Clause]}|Tail], Basename, Acc) ->
-     filter_forms(Msgs, Enums, Tail, Basename, [expand_iolist_function(Msgs, L, Clause)|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,L,iolist,2,[Clause]}|Tail], Basename, Acc) ->
+     filter_forms(Msgs, Enums, Services, Tail, Basename, [expand_iolist_function(Msgs, L, Clause)|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,decode_pikachu,1,[Clause]}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,decode_pikachu,1,[Clause]}|Tail], Basename, Acc) ->
     Functions = [begin
 		     {function,
 		      L,
@@ -258,72 +269,92 @@ filter_forms(Msgs, Enums, [{function,L,decode_pikachu,1,[Clause]}|Tail], Basenam
 		      1,
 		      [replace_atom(Clause, pikachu, atomize(Name))]} 
 		 end || {Name, _, _} <- Msgs],
-    filter_forms(Msgs, Enums, Tail, Basename, Functions ++ Acc);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, Functions ++ Acc);
 
-filter_forms(Msgs, Enums, [{function,L,decode,2,[Clause]}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [expand_decode_function(Msgs, L, Clause)|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,L,decode,2,[Clause]}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [expand_decode_function(Msgs, L, Clause)|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,to_record,2,[Clause]}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [expand_to_record_function(Msgs, L, Clause)|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,L,to_record,2,[Clause]}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [expand_to_record_function(Msgs, L, Clause)|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,enum_to_int,2,[Clause]}|Tail], Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,enum_to_int,2,[Clause]}|Tail], Basename, Acc) ->
     Acc2 = case any_message_has_fields(Msgs) orelse any_message_has_extentions(Msgs) of
         true -> [expand_enum_to_int_function(Enums,L,Clause)|Acc];
         false -> Acc
     end,
-    filter_forms(Msgs, Enums, Tail, Basename, Acc2);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, Acc2);
 
-filter_forms(Msgs, Enums, [{function,L,int_to_enum,2,[Clause]}|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [expand_int_to_enum_function(Enums, L, Clause)|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,L,int_to_enum,2,[Clause]}|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [expand_int_to_enum_function(Enums, L, Clause)|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,decode_extensions,1,[Clause,Catchall]}|Tail],Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,decode_extensions,1,[Clause,Catchall]}|Tail],Basename, Acc) ->
     NewClauses = filter_decode_extensions_clause(Msgs, Msgs, Clause, []),
     NewHead = {function,L,decode_extensions,1,NewClauses ++ [Catchall]},
-    filter_forms(Msgs, Enums, Tail,Basename,[NewHead|Acc]);
+    filter_forms(Msgs, Enums, Services, Tail,Basename,[NewHead|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,extension_size,1,[RecClause,CatchAll]}|Tail],Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,extension_size,1,[RecClause,CatchAll]}|Tail],Basename, Acc) ->
     NewRecClauses = filter_extension_size(Msgs, RecClause, []),
     NewClauses = lists:reverse([CatchAll | NewRecClauses]),
     NewHead = {function,L,extension_size,1,NewClauses},
-    filter_forms(Msgs, Enums, Tail, Basename, [NewHead|Acc]);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [NewHead|Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,has_extension,2,[FilterClause,CatchallClause]}|Tail],Basename,Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,has_extension,2,[FilterClause,CatchallClause]}|Tail],Basename,Acc) ->
     NewRecClauses = filter_has_extension(Msgs, FilterClause, []),
     NewClauses = lists:reverse([CatchallClause | NewRecClauses]),
     NewHead = {function,L,has_extension,2,NewClauses},
-    filter_forms(Msgs, Enums, Tail, Basename, [NewHead | Acc]);
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [NewHead | Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,get_extension,2,[AtomClause,IntClause,Catchall]}|Tail],Basename,Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,get_extension,2,[AtomClause,IntClause,Catchall]}|Tail],Basename,Acc) ->
     NewAtomClauses = filter_get_extension_atom(Msgs,AtomClause,[]),
     NewRecClauses = filter_get_extension_integer(Msgs, IntClause, NewAtomClauses),
     NewClauses = lists:reverse([Catchall | NewRecClauses]),
     NewHead = {function,L,get_extension,2,NewClauses},
-    filter_forms(Msgs,Enums, Tail, Basename, [NewHead | Acc]);
+    filter_forms(Msgs,Enums, Services, Tail, Basename, [NewHead | Acc]);
 
-filter_forms(Msgs, Enums, [{function,L,set_extension,3,[RecClause,Catchall]}|Tail],Basename, Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,L,set_extension,3,[RecClause,Catchall]}|Tail],Basename, Acc) ->
     NewRecClauses = filter_set_extension(Msgs, RecClause, []),
     NewClauses = lists:reverse([Catchall | NewRecClauses]),
     NewHead = {function,L,set_extension,3,NewClauses},
-    filter_forms(Msgs,Enums,Tail,Basename,[NewHead|Acc]);
+    filter_forms(Msgs,Enums, Services,Tail,Basename,[NewHead|Acc]);
 
-filter_forms(Msgs, Enums, [{function,_L,with_default,2,_Args}=Func|Tail],Basename,Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,_L,with_default,2,_Args}=Func|Tail],Basename,Acc) ->
     Acc2 = case any_message_has_fields(Msgs) of
         true -> [Func|Acc];
         false -> Acc
     end,
-    filter_forms(Msgs,Enums,Tail,Basename,Acc2);
+    filter_forms(Msgs,Enums, Services,Tail,Basename,Acc2);
 
-filter_forms(Msgs, Enums, [{function,_L,pack,5,_Clauses}=Func|Tail],Basename,Acc) ->
+filter_forms(Msgs, Enums, Services, [{function,_L,pack,5,_Clauses}=Func|Tail],Basename,Acc) ->
     Acc2 = case any_message_has_fields(Msgs) orelse any_message_has_extentions(Msgs) of
         true -> [Func|Acc];
         false -> Acc
     end,
-    filter_forms(Msgs,Enums,Tail,Basename,Acc2);
+    filter_forms(Msgs,Enums, Services,Tail,Basename,Acc2);
 
-filter_forms(Msgs, Enums, [Form|Tail], Basename, Acc) ->
-    filter_forms(Msgs, Enums, Tail, Basename, [Form|Acc]);
+filter_forms(Msgs, Enums, Services, [{function,_L, register_pikaservice, 3, Clauses}=Func|Tail], Basename, Acc) ->
+    % error_logger:warning_report(["Filter forms encountered register function.", Services, Clauses]),
+    RegisterForms = build_register_forms(Services, Func),
+    % error_logger:warning_report(["Build the following forms.", RegisterForms]),
+    filter_forms(Msgs, Enums, Services, Tail, Basename, RegisterForms ++ Acc);
 
-filter_forms(_, _, [], _, Acc) -> lists:reverse(Acc).
+filter_forms(Msgs, Enums, Services, [{attribute,L,export,[{register_pikaservice,3},{use_pikaservice,2}]}|Tail], Basename, Acc) ->
+    Exports = lists:foldl(
+        fun({service,Name,_,_}, Acc1) ->
+            [{list_to_atom("register_" ++ string:to_lower(Name)),3},
+             {list_to_atom("use_" ++ string:to_lower(Name)), 2}     | Acc1]
+        end, [], Services),
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [{attribute,L,export,Exports}|Acc]);
+
+filter_forms(Msgs, Enums, Services, [{function,_L, use_pikaservice, 2, Clauses}=Func|Tail], Basename, Acc) ->
+    % error_logger:warning_report(["Filter forms encountered register function.", Services, Clauses]),
+    UseForms = build_use_forms(Services, Func),
+    error_logger:warning_report(["Build the following forms.", UseForms]),
+    filter_forms(Msgs, Enums, Services, Tail, Basename, UseForms ++ Acc);
+
+filter_forms(Msgs, Enums, Services, [Form|Tail], Basename, Acc) ->
+    filter_forms(Msgs, Enums, Services, Tail, Basename, [Form|Acc]);
+
+filter_forms(_, _, _, [], _, Acc) -> lists:reverse(Acc).
 
 any_message_has_extentions(Msgs) ->
     Predicate = fun({_,_,disallowed}) -> false; (_) -> true end,
@@ -685,6 +716,12 @@ collect_full_messages([{extend, Name, ExtendedFields} | Tail], Collected) ->
     collect_full_messages(Tail, NewCollected);
 collect_full_messages([file_boundary | Tail], Collected) ->
     collect_full_messages(Tail, Collected#collected{package = undefined});
+
+collect_full_messages([Service = {service, Name, Methods} | Tail], Collected) ->
+    SName = Collected#collected.package ++ "." ++ Name,
+    collect_full_messages(Tail, Collected#collected{services=[{service, Name, SName, Methods}]++Collected#collected.services});
+    
+
 %% Skip anything we don't understand
 collect_full_messages([Skip|Tail], Acc) ->
     error_logger:warning_report(["Unkown, skipping",
@@ -961,3 +998,51 @@ type_path_to_type(TypePath) ->
             TypePath
     end.
 
+replace_str({string, N, Find}, Find, Rep) -> {string, N, Rep};
+replace_str(Hay, Find, Rep) when is_list(Hay) ->
+    [replace_str(Term, Find, Rep) || Term <- Hay];
+replace_str(Hay, Find, Rep) when is_tuple(Hay) ->
+    list_to_tuple(replace_str(tuple_to_list(Hay), Find, Rep));
+replace_str(Hay, _, _) -> Hay.
+
+build_register_forms(Services, Form={function, L, register_pikaservice, 3, [Clause|CatchAll]}) ->
+    {clause, CN, Args, Guard, [MethClause,RegCall|CatchAll2]} = Clause,
+    {match, MN, Var, Cons} = MethClause,
+    lists:foldl(fun(Service={service, Name,  FullName, Methods}, Acc) ->
+        ConsClause = build_cons_clause(register, Cons, Methods),
+        MethClause2 = {match, MN, Var, ConsClause},
+        RegCall2 = replace_str(RegCall, "pokemon.PikaService", FullName),
+        FullClause = {clause, CN, Args, Guard, [MethClause2, RegCall2 | CatchAll2]},
+        FnAtom = list_to_atom("register_" ++ string:to_lower(Name)),
+        Function = {function, L, FnAtom, 3, [FullClause|CatchAll]},
+        [Function | Acc]
+    end, [], Services).
+
+build_use_forms(Services, Form={function, L, use_pikaservice, 2, [Clause|CatchAll]}) ->
+    {clause, CN, Args, Guard, [MethClause, StartCall|CatchAll2]} = Clause,
+    {match, MN, Var, Cons} = MethClause,
+    lists:foldl(fun(Service={service,Name, FullName, Methods}, Acc) ->
+        ConsClause = build_cons_clause(use, Cons, Methods),
+        MethClause2 = {match, MN, Var, ConsClause},
+        StartCall2 = replace_str(StartCall, "pokemon.PikaService", FullName),
+        FullClause = {clause, CN, Args, Guard, [MethClause2, StartCall2 | CatchAll2]},
+        FnAtom = list_to_atom("use_" ++ string:to_lower(Name)),
+        Function = {function, L, FnAtom, 2, [FullClause|CatchAll]},
+        [Function | Acc]
+    end, [], Services).
+
+build_cons_clause(_, {cons, _N, _Cons, Nil}, []) -> Nil;
+build_cons_clause(register, Base={cons, N, Cons, _Nil}, [Method={rpc, Name, Input, Output}|Tail]) ->
+    Atom = atomize(Name),
+    New1 = replace_atom(Cons, pika, atomize(Name)),
+    New2 = replace_str(New1, "Pika", Name),
+    New3 = replace_atom(New2, decode_pikachu, list_to_atom("decode_" ++ string:to_lower(Input))),
+    New4 = replace_atom(New3, encode_pikachu, list_to_atom("encode_" ++ string:to_lower(Output))),
+    {cons, N, New4, build_cons_clause(register, Base, Tail)};
+build_cons_clause(use, Base={cons, N, Cons, _Nil}, [Method={rpc, Name, Input, Output}|Tail]) ->
+    Atom = atomize(Name),
+    New1 = replace_atom(Cons, pika, atomize(Name)),
+    New2 = replace_str(New1, "Pika", Name),
+    New3 = replace_atom(New2, decode_pikachu, list_to_atom("decode_" ++ string:to_lower(Output))),
+    New4 = replace_atom(New3, encode_pikachu, list_to_atom("encode_" ++ string:to_lower(Input))),
+    {cons, N, New4, build_cons_clause(use, Base, Tail)}.
